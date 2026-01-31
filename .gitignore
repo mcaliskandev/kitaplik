@@ -1,0 +1,66 @@
+# Build outputs
+/build/
+/build-*/
+/out/
+/dist/
+
+# CMake (in-source builds)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+Makefile
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# Qt / Qt Creator
+*.pro.user
+*.pro.user.*
+*.qmlc
+*.jsc
+*.user
+*.user.*
+CMakeLists.txt.user
+*.autosave
+
+# C/C++ artifacts
+*.o
+*.obj
+*.lo
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.app
+*.pdb
+*.dSYM/
+
+# IDEs
+.idea/
+.fleet/
+.vs/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+#vscode 
+.vscode/
+.VSCodeCounter/
+
+# doxygen
+doxygen/**
+
+learn_list.md
+IMPLEMENTATION_SUMMARY.md
+Session.vim
+docs/
+tests/
+README.md

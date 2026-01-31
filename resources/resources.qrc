@@ -1,0 +1,6 @@
+<!DOCTYPE RCC>
+<RCC>
+  <qresource prefix="/src/ui">
+    <file>icons/go_to_path.png</file>
+  </qresource>
+</RCC>
