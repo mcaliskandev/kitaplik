@@ -28,6 +28,7 @@
 #include <QPushButton>
 #include <QResource>
 #include <QSortFilterProxyModel>
+#include <QStorageInfo>
 #include <QStyledItemDelegate>
 #include <QStyle>
 #include <QTimer>
@@ -76,7 +77,7 @@ QString cleanPath(const QString& path)
     if (trimmed.startsWith("~/"))
         return QDir::homePath() + trimmed.sliced(1);
 
-    return QDir(path).absolutePath();
+    return QDir::cleanPath(QDir(path).absolutePath());
 }
 
 constexpr int PinnedPathRole = Qt::UserRole + 1;
@@ -101,6 +102,76 @@ bool removeRecursively(const QString& path, QString* error)
     if (!QFile::remove(path)) {
         if (error)
             *error = QString("Failed to delete file: %1").arg(path);
+        return false;
+    }
+    return true;
+}
+
+QString normalizePathForFs(const QString& path)
+{
+    const QString clean = QDir::cleanPath(QDir(path).absolutePath());
+    const QFileInfo info(clean);
+    if (info.exists()) {
+        const QString canonical = info.canonicalFilePath();
+        if (!canonical.trimmed().isEmpty())
+            return canonical;
+    }
+    return clean;
+}
+
+QString nearestExistingPath(const QString& path)
+{
+    QFileInfo cursor(path);
+    QString current = cursor.absoluteFilePath();
+    while (!current.trimmed().isEmpty()) {
+        const QFileInfo info(current);
+        if (info.exists())
+            return info.absoluteFilePath();
+        const QDir parent = info.dir();
+        if (!parent.exists() || parent.absolutePath() == current)
+            break;
+        current = parent.absolutePath();
+    }
+    return {};
+}
+
+bool ensureWritableTarget(const QString& path, QString* error)
+{
+    const QString existing = nearestExistingPath(path);
+    if (existing.trimmed().isEmpty()) {
+        if (error)
+            *error = QString("No writable parent for path: %1").arg(path);
+        return false;
+    }
+
+    const QFileInfo existingInfo(existing);
+    if (!existingInfo.isWritable()) {
+        if (error)
+            *error = QString("Permission denied: %1").arg(existing);
+        return false;
+    }
+
+    const QStorageInfo storage(existing);
+    if (storage.isValid() && storage.isReadOnly()) {
+        if (error)
+            *error = QString("Read-only filesystem: %1").arg(storage.rootPath());
+        return false;
+    }
+
+    return true;
+}
+
+bool ensureReadableSource(const QString& path, QString* error)
+{
+    const QFileInfo info(path);
+    if (!info.exists()) {
+        if (error)
+            *error = QString("Missing source: %1").arg(path);
+        return false;
+    }
+    if (!info.isReadable()) {
+        if (error)
+            *error = QString("Permission denied: %1").arg(path);
         return false;
     }
     return true;
@@ -643,9 +714,15 @@ void Kitaplik::showFileMenu(const QPoint& viewPos)
 
 void Kitaplik::onMenuNewFolder(const QString& parentDir)
 {
-    const QFileInfo parentInfo(parentDir);
+    const QString normalizedParentDir = normalizePathForFs(parentDir);
+    const QFileInfo parentInfo(normalizedParentDir);
     if (!parentInfo.exists() || !parentInfo.isDir()) {
         QMessageBox::warning(this, "New Folder", QString("Invalid directory:\n%1").arg(parentDir));
+        return;
+    }
+    QString writeError;
+    if (!ensureWritableTarget(normalizedParentDir, &writeError)) {
+        QMessageBox::warning(this, "New Folder", writeError);
         return;
     }
 
@@ -658,7 +735,7 @@ void Kitaplik::onMenuNewFolder(const QString& parentDir)
         return;
     }
 
-    QDir dir(parentDir);
+    QDir dir(normalizedParentDir);
     const QString newPath = dir.filePath(name);
     if (QFileInfo::exists(newPath)) {
         QMessageBox::warning(this, "New Folder", QString("Already exists: %1").arg(name));
@@ -675,9 +752,15 @@ void Kitaplik::onMenuNewFolder(const QString& parentDir)
 
 void Kitaplik::onMenuPaste(const QString& destDir)
 {
-    const QFileInfo destInfo(destDir);
+    const QString normalizedDestInput = normalizePathForFs(destDir);
+    const QFileInfo destInfo(normalizedDestInput);
     if (!destInfo.exists() || !destInfo.isDir()) {
         QMessageBox::warning(this, "Paste", QString("Invalid directory:\n%1").arg(destDir));
+        return;
+    }
+    QString writeError;
+    if (!ensureWritableTarget(normalizedDestInput, &writeError)) {
+        QMessageBox::warning(this, "Paste", writeError);
         return;
     }
 
@@ -697,8 +780,9 @@ void Kitaplik::onMenuPaste(const QString& destDir)
     for (const QUrl& url : mime->urls()) {
         if (!url.isLocalFile())
             continue;
-        const QString srcPath = url.toLocalFile();
-        if (!QFileInfo::exists(srcPath))
+        const QString srcPath = normalizePathForFs(url.toLocalFile());
+        QString readError;
+        if (!ensureReadableSource(srcPath, &readError))
             continue;
         sourcePaths.push_back(srcPath);
     }
@@ -710,10 +794,10 @@ void Kitaplik::onMenuPaste(const QString& destDir)
     setCopyPasteProgressVisible(true, pasteOpLabel);
 
     QPointer<Kitaplik> self(this);
-    fileOpThread = std::jthread([self, sourcePaths, destDir, isCut] {
+    fileOpThread = std::jthread([self, sourcePaths, normalizedDestInput, isCut] {
         QStringList errors;
 
-        const QString normalizedDestDir = QDir(destDir).absolutePath();
+        const QString normalizedDestDir = normalizePathForFs(normalizedDestInput);
         std::vector<std::uint64_t> perSrcBytes;
         perSrcBytes.reserve(static_cast<size_t>(sourcePaths.size()));
         std::uint64_t totalBytes = 0;
@@ -813,6 +897,13 @@ void Kitaplik::onMenuPaste(const QString& destDir)
             const QFileInfo srcInfo(srcPath);
             if (!srcInfo.exists())
                 continue;
+            if (isCut) {
+                QString sourceWriteError;
+                if (!ensureWritableTarget(srcPath, &sourceWriteError)) {
+                    errors.push_back(sourceWriteError);
+                    continue;
+                }
+            }
 
             const QString destPath = QDir(normalizedDestDir).filePath(srcInfo.fileName());
             if (QDir::cleanPath(srcPath) == QDir::cleanPath(destPath))
@@ -899,23 +990,47 @@ void Kitaplik::onMenuPaste(const QString& destDir)
 
 void Kitaplik::onMenuOpen(const QString& targetPath)
 {
-    const QFileInfo info(targetPath);
+    const QString normalizedTargetPath = normalizePathForFs(targetPath);
+    const QFileInfo info(normalizedTargetPath);
     if (info.isDir()) {
-        setRootPath(targetPath);
+        setRootPath(normalizedTargetPath);
         return;
     }
-    QDesktopServices::openUrl(QUrl::fromLocalFile(targetPath));
+    if (!info.isReadable()) {
+        QMessageBox::warning(this, "Open", QString("Permission denied:\n%1").arg(normalizedTargetPath));
+        return;
+    }
+    const auto executableBits = QFileDevice::ExeOwner | QFileDevice::ExeGroup | QFileDevice::ExeOther;
+    if ((info.permissions() & executableBits) != QFileDevice::Permissions()) {
+        const auto choice = QMessageBox::question(
+            this,
+            "Open executable",
+            QString("This file is executable.\nOpen explicitly with the default application?\n\n%1")
+                .arg(normalizedTargetPath),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);
+        if (choice != QMessageBox::Yes)
+            return;
+    }
+    if (!QDesktopServices::openUrl(QUrl::fromLocalFile(normalizedTargetPath)))
+        QMessageBox::warning(this, "Open", QString("Failed to open:\n%1").arg(normalizedTargetPath));
 }
 
 void Kitaplik::onMenuRename(const QString& targetPath)
 {
-    const QFileInfo info(targetPath);
+    const QString normalizedTargetPath = normalizePathForFs(targetPath);
+    const QFileInfo info(normalizedTargetPath);
     const QString oldName = info.fileName();
     const QString newName = QInputDialog::getText(this, "Rename", "New name:", QLineEdit::Normal, oldName);
     if (newName.trimmed().isEmpty() || newName == oldName)
         return;
 
     QDir parentDir = info.dir();
+    QString writeError;
+    if (!ensureWritableTarget(parentDir.absolutePath(), &writeError)) {
+        QMessageBox::warning(this, "Rename", writeError);
+        return;
+    }
     const QString newPath = parentDir.filePath(newName);
     if (QFileInfo::exists(newPath)) {
         QMessageBox::warning(this, "Rename", QString("Already exists: %1").arg(newName));
@@ -933,7 +1048,7 @@ void Kitaplik::onMenuRename(const QString& targetPath)
 void Kitaplik::onMenuCopy(const QString& targetPath)
 {
     auto* mimeData = new QMimeData();
-    mimeData->setUrls({ QUrl::fromLocalFile(targetPath) });
+    mimeData->setUrls({ QUrl::fromLocalFile(normalizePathForFs(targetPath)) });
     mimeData->setData(ClipboardCutMimeType, QByteArray("0"));
     QApplication::clipboard()->setMimeData(mimeData);
 }
@@ -941,14 +1056,15 @@ void Kitaplik::onMenuCopy(const QString& targetPath)
 void Kitaplik::onMenuCut(const QString& targetPath)
 {
     auto* mimeData = new QMimeData();
-    mimeData->setUrls({ QUrl::fromLocalFile(targetPath) });
+    mimeData->setUrls({ QUrl::fromLocalFile(normalizePathForFs(targetPath)) });
     mimeData->setData(ClipboardCutMimeType, QByteArray("1"));
     QApplication::clipboard()->setMimeData(mimeData);
 }
 
 void Kitaplik::onMenuDelete(const QString& targetPath)
 {
-    const QFileInfo info(targetPath);
+    const QString normalizedTargetPath = normalizePathForFs(targetPath);
+    const QFileInfo info(normalizedTargetPath);
     const QString label = info.fileName().trimmed().isEmpty() ? targetPath : info.fileName();
 
     const auto choice =
@@ -956,8 +1072,14 @@ void Kitaplik::onMenuDelete(const QString& targetPath)
     if (choice != QMessageBox::Yes)
         return;
 
+    QString writeError;
+    if (!ensureWritableTarget(normalizedTargetPath, &writeError)) {
+        QMessageBox::warning(this, "Delete", writeError);
+        return;
+    }
+
     QString error;
-    if (!removeRecursively(targetPath, &error))
+    if (!removeRecursively(normalizedTargetPath, &error))
         QMessageBox::warning(this, "Delete", error.isEmpty() ? "Delete failed." : error);
 
     navigateTo(currentPath(), false);
