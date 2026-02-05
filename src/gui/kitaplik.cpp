@@ -18,6 +18,7 @@
 #include <QStringList>
 #include <QLocale>
 #include <QMenu>
+#include <QMimeDatabase>
 #include <QListView>
 #include <QToolButton>
 #include <QMessageBox>
@@ -705,7 +706,7 @@ void Kitaplik::showFileMenu(const QPoint& viewPos)
     const QString targetPath = model.filePath(sourceIndex);
 
     QMenu menu(ui->treeView);
-    QAction* openAct = menu.addAction("Open");
+    QAction* openAct = menu.addAction("Open with default app");
     QAction* renameAct = menu.addAction("Rename");
     menu.addSeparator();
     QAction* copyAct = menu.addAction("Copy");
@@ -1022,13 +1023,18 @@ void Kitaplik::onMenuOpen(const QString& targetPath)
         QMessageBox::warning(this, "Open", QString("Permission denied:\n%1").arg(normalizedTargetPath));
         return;
     }
+    const QMimeType mime = QMimeDatabase().mimeTypeForFile(normalizedTargetPath, QMimeDatabase::MatchDefault);
+    if (!mime.isValid()) {
+        QMessageBox::warning(this, "Open", QString("No default application available for:\n%1").arg(normalizedTargetPath));
+        return;
+    }
     const auto executableBits = QFileDevice::ExeOwner | QFileDevice::ExeGroup | QFileDevice::ExeOther;
     if ((info.permissions() & executableBits) != QFileDevice::Permissions()) {
         const auto choice = QMessageBox::question(
             this,
             "Open executable",
-            QString("This file is executable.\nOpen explicitly with the default application?\n\n%1")
-                .arg(normalizedTargetPath),
+            QString("MIME type: %1\n\nThis file is executable.\nOpen explicitly with the default application?\n\n%2")
+                .arg(mime.name(), normalizedTargetPath),
             QMessageBox::Yes | QMessageBox::No,
             QMessageBox::No);
         if (choice != QMessageBox::Yes)
