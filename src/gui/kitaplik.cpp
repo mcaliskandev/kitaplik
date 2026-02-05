@@ -28,11 +28,13 @@
 #include <QPushButton>
 #include <QResource>
 #include <QScrollBar>
+#include <QStandardPaths>
 #include <QSortFilterProxyModel>
 #include <QStorageInfo>
 #include <QStyledItemDelegate>
 #include <QStyle>
 #include <QTimer>
+#include <QTextStream>
 #include <QUrl>
 
 #include "ui_kitaplik.h"
@@ -672,11 +674,17 @@ void Kitaplik::finishPasteOperation(const QString& errorText, bool clearClipboar
 
 void Kitaplik::showFileMenu(const QPoint& viewPos)
 {
+    const bool browsingTrashFiles = isInsideTrashFiles(currentPath());
     const QModelIndex index = ui->treeView->indexAt(viewPos);
     if (!index.isValid()) {
         QMenu menu(ui->treeView);
         QAction* newFolderAct = menu.addAction("New Folder");
         QAction* pasteAct = menu.addAction("Paste");
+        QAction* emptyTrashAct = nullptr;
+        if (browsingTrashFiles) {
+            menu.addSeparator();
+            emptyTrashAct = menu.addAction("Empty Trash");
+        }
         const auto* mime = QApplication::clipboard()->mimeData();
         pasteAct->setEnabled(mime && mime->hasUrls() && QFileInfo(currentPath()).isDir());
         QAction* chosen = menu.exec(ui->treeView->viewport()->mapToGlobal(viewPos));
@@ -684,6 +692,8 @@ void Kitaplik::showFileMenu(const QPoint& viewPos)
             onMenuNewFolder(currentPath());
         } else if (chosen == pasteAct) {
             onMenuPaste(currentPath());
+        } else if (emptyTrashAct && chosen == emptyTrashAct) {
+            onMenuEmptyTrash();
         }
         return;
     }
@@ -700,7 +710,10 @@ void Kitaplik::showFileMenu(const QPoint& viewPos)
     QAction* copyAct = menu.addAction("Copy");
     QAction* cutAct = menu.addAction("Cut");
     menu.addSeparator();
-    QAction* deleteAct = menu.addAction("Delete");
+    QAction* restoreAct = nullptr;
+    if (browsingTrashFiles)
+        restoreAct = menu.addAction("Restore");
+    QAction* deleteAct = menu.addAction(browsingTrashFiles ? "Delete Permanently" : "Delete");
 
     QAction* chosen = menu.exec(ui->treeView->viewport()->mapToGlobal(viewPos));
     if (!chosen)
@@ -714,6 +727,8 @@ void Kitaplik::showFileMenu(const QPoint& viewPos)
         onMenuCopy(targetPath);
     else if (chosen == cutAct)
         onMenuCut(targetPath);
+    else if (restoreAct && chosen == restoreAct)
+        onMenuRestoreFromTrash(targetPath);
     else if (chosen == deleteAct)
         onMenuDelete(targetPath);
 }
@@ -1072,9 +1087,14 @@ void Kitaplik::onMenuDelete(const QString& targetPath)
     const QString normalizedTargetPath = normalizePathForFs(targetPath);
     const QFileInfo info(normalizedTargetPath);
     const QString label = info.fileName().trimmed().isEmpty() ? targetPath : info.fileName();
+    const bool permanentDelete = isInsideTrashFiles(normalizedTargetPath);
 
-    const auto choice =
-        QMessageBox::question(this, "Delete", QString("Delete \"%1\"?").arg(label), QMessageBox::Yes | QMessageBox::No);
+    const auto choice = QMessageBox::question(this,
+                                              "Delete",
+                                              permanentDelete
+                                                  ? QString("Permanently delete \"%1\"?").arg(label)
+                                                  : QString("Move \"%1\" to trash?").arg(label),
+                                              QMessageBox::Yes | QMessageBox::No);
     if (choice != QMessageBox::Yes)
         return;
 
@@ -1085,7 +1105,12 @@ void Kitaplik::onMenuDelete(const QString& targetPath)
     }
 
     QString error;
-    if (!removeRecursively(normalizedTargetPath, &error))
+    bool ok = false;
+    if (permanentDelete)
+        ok = removeRecursively(normalizedTargetPath, &error);
+    else
+        ok = moveToTrash(normalizedTargetPath, &error);
+    if (!ok)
         QMessageBox::warning(this, "Delete", error.isEmpty() ? "Delete failed." : error);
 
     navigateTo(currentPath(), false);
@@ -1360,4 +1385,233 @@ void Kitaplik::refreshCurrentDirectoryPreservingView()
         if (ui->treeView->verticalScrollBar())
             ui->treeView->verticalScrollBar()->setValue(scrollValue);
     });
+}
+
+QString Kitaplik::trashFilesPath() const
+{
+    const QString homePath = QDir::homePath();
+    return QDir::cleanPath(QDir(homePath).filePath(".local/share/Trash/files"));
+}
+
+QString Kitaplik::trashInfoPath() const
+{
+    const QString homePath = QDir::homePath();
+    return QDir::cleanPath(QDir(homePath).filePath(".local/share/Trash/info"));
+}
+
+bool Kitaplik::isInsideTrashFiles(const QString& path) const
+{
+    const QString normalized = normalizePathForFs(path);
+    const QString trashRoot = normalizePathForFs(trashFilesPath());
+    if (normalized == trashRoot)
+        return true;
+    return normalized.startsWith(trashRoot + QDir::separator());
+}
+
+QString Kitaplik::buildUniquePath(const QString& destinationPath) const
+{
+    return makeUniqueKeepBothPath(destinationPath);
+}
+
+bool Kitaplik::moveToTrash(const QString& targetPath, QString* error)
+{
+    const QString filesDirPath = trashFilesPath();
+    const QString infoDirPath = trashInfoPath();
+    QDir filesDir(filesDirPath);
+    QDir infoDir(infoDirPath);
+    if (!filesDir.exists() && !QDir().mkpath(filesDirPath)) {
+        if (error)
+            *error = QString("Failed to initialize trash: %1").arg(filesDirPath);
+        return false;
+    }
+    if (!infoDir.exists() && !QDir().mkpath(infoDirPath)) {
+        if (error)
+            *error = QString("Failed to initialize trash info: %1").arg(infoDirPath);
+        return false;
+    }
+
+    const QFileInfo sourceInfo(targetPath);
+    QString trashName = sourceInfo.fileName();
+    if (trashName.trimmed().isEmpty())
+        trashName = QString("item-%1").arg(QString::number(QDateTime::currentMSecsSinceEpoch()));
+    QString destinationInTrash = filesDir.filePath(trashName);
+    if (QFileInfo::exists(destinationInTrash)) {
+        destinationInTrash = buildUniquePath(destinationInTrash);
+        trashName = QFileInfo(destinationInTrash).fileName();
+    }
+
+    bool moved = false;
+    if (sourceInfo.isDir())
+        moved = QDir().rename(targetPath, destinationInTrash);
+    else
+        moved = QFile::rename(targetPath, destinationInTrash);
+    if (!moved) {
+        QString copyError;
+        std::uint64_t done = 0;
+        const auto total = totalBytesForPath(targetPath, &copyError).value_or(0);
+        moved = copyRecursivelyWithProgress(targetPath,
+                                            destinationInTrash,
+                                            &done,
+                                            total,
+                                            [](std::uint64_t, std::uint64_t) {},
+                                            [](const QString&, const QString&, bool) { return ConflictChoice::KeepBoth; },
+                                            nullptr,
+                                            &copyError);
+        if (moved) {
+            QString removeError;
+            if (!removeRecursively(targetPath, &removeError)) {
+                if (error)
+                    *error = removeError.isEmpty() ? QString("Failed to remove original: %1").arg(targetPath) : removeError;
+                return false;
+            }
+        } else {
+            if (error)
+                *error = copyError.isEmpty() ? QString("Failed to move to trash: %1").arg(targetPath) : copyError;
+            return false;
+        }
+    }
+
+    QFile infoFile(infoDir.filePath(trashName + ".trashinfo"));
+    if (!infoFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+        if (error)
+            *error = QString("Moved to trash, but failed to write metadata for restore: %1").arg(trashName);
+        return true;
+    }
+    QTextStream stream(&infoFile);
+    stream << "[Trash Info]\n";
+    stream << "Path=" << QString::fromUtf8(QUrl::toPercentEncoding(targetPath, "/")) << "\n";
+    stream << "DeletionDate=" << QDateTime::currentDateTimeUtc().toString("yyyy-MM-ddTHH:mm:ss") << "\n";
+    infoFile.close();
+
+    return true;
+}
+
+bool Kitaplik::restoreFromTrash(const QString& trashPath, QString* error)
+{
+    const QString normalizedTrashPath = normalizePathForFs(trashPath);
+    if (!isInsideTrashFiles(normalizedTrashPath)) {
+        if (error)
+            *error = QString("Not a trash item: %1").arg(trashPath);
+        return false;
+    }
+
+    const QString trashName = QFileInfo(normalizedTrashPath).fileName();
+    QFile infoFile(QDir(trashInfoPath()).filePath(trashName + ".trashinfo"));
+    if (!infoFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (error)
+            *error = QString("Missing restore metadata: %1").arg(trashName);
+        return false;
+    }
+
+    QString originalPath;
+    QTextStream stream(&infoFile);
+    while (!stream.atEnd()) {
+        const QString line = stream.readLine();
+        if (line.startsWith("Path=")) {
+            const QByteArray encoded = line.mid(5).toUtf8();
+            originalPath = QString::fromUtf8(QUrl::fromPercentEncoding(encoded).toUtf8());
+            break;
+        }
+    }
+    infoFile.close();
+    if (originalPath.trimmed().isEmpty()) {
+        if (error)
+            *error = QString("Invalid restore metadata: %1").arg(trashName);
+        return false;
+    }
+
+    QString destinationPath = normalizePathForFs(originalPath);
+    if (QFileInfo::exists(destinationPath))
+        destinationPath = buildUniquePath(destinationPath);
+
+    QDir parentDir = QFileInfo(destinationPath).dir();
+    if (!parentDir.exists() && !QDir().mkpath(parentDir.absolutePath())) {
+        if (error)
+            *error = QString("Failed to recreate parent directory: %1").arg(parentDir.absolutePath());
+        return false;
+    }
+
+    const QFileInfo trashInfo(normalizedTrashPath);
+    bool moved = false;
+    if (trashInfo.isDir())
+        moved = QDir().rename(normalizedTrashPath, destinationPath);
+    else
+        moved = QFile::rename(normalizedTrashPath, destinationPath);
+    if (!moved) {
+        QString copyError;
+        std::uint64_t done = 0;
+        const auto total = totalBytesForPath(normalizedTrashPath, &copyError).value_or(0);
+        moved = copyRecursivelyWithProgress(normalizedTrashPath,
+                                            destinationPath,
+                                            &done,
+                                            total,
+                                            [](std::uint64_t, std::uint64_t) {},
+                                            [](const QString&, const QString&, bool) { return ConflictChoice::KeepBoth; },
+                                            nullptr,
+                                            &copyError);
+        if (moved) {
+            QString removeError;
+            if (!removeRecursively(normalizedTrashPath, &removeError)) {
+                if (error)
+                    *error = removeError.isEmpty() ? QString("Failed to remove trashed item: %1").arg(normalizedTrashPath) : removeError;
+                return false;
+            }
+        } else {
+            if (error)
+                *error = copyError.isEmpty() ? QString("Failed to restore: %1").arg(trashName) : copyError;
+            return false;
+        }
+    }
+
+    infoFile.remove();
+    return true;
+}
+
+bool Kitaplik::emptyTrash(QString* error)
+{
+    const QString files = trashFilesPath();
+    const QString info = trashInfoPath();
+
+    QString removeError;
+    if (!removeRecursively(files, &removeError)) {
+        if (error)
+            *error = removeError;
+        return false;
+    }
+    if (!removeRecursively(info, &removeError)) {
+        if (error)
+            *error = removeError;
+        return false;
+    }
+
+    if (!QDir().mkpath(files) || !QDir().mkpath(info)) {
+        if (error)
+            *error = "Failed to recreate trash directories.";
+        return false;
+    }
+
+    return true;
+}
+
+void Kitaplik::onMenuRestoreFromTrash(const QString& trashPath)
+{
+    QString error;
+    if (!restoreFromTrash(trashPath, &error))
+        QMessageBox::warning(this, "Restore", error.isEmpty() ? "Restore failed." : error);
+    navigateTo(currentPath(), false);
+}
+
+void Kitaplik::onMenuEmptyTrash()
+{
+    const auto choice = QMessageBox::question(this,
+                                              "Empty Trash",
+                                              "Permanently delete all items in trash?",
+                                              QMessageBox::Yes | QMessageBox::No);
+    if (choice != QMessageBox::Yes)
+        return;
+
+    QString error;
+    if (!emptyTrash(&error))
+        QMessageBox::warning(this, "Empty Trash", error.isEmpty() ? "Failed to empty trash." : error);
+    navigateTo(currentPath(), false);
 }

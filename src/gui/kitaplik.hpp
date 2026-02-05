@@ -58,6 +58,8 @@ private:
     void onMenuCopy(const QString& targetPath);
     void onMenuCut(const QString& targetPath);
     void onMenuDelete(const QString& targetPath);
+    void onMenuRestoreFromTrash(const QString& trashPath);
+    void onMenuEmptyTrash();
     void onMenuNewFolder(const QString& parentDir);
     void onMenuPaste(const QString& destDir);
 
@@ -79,6 +81,13 @@ private:
     void updateDirectoryWatcher(const QString& path);
     void scheduleWatchedRefresh(const QString& changedPath);
     void refreshCurrentDirectoryPreservingView();
+    bool isInsideTrashFiles(const QString& path) const;
+    QString trashFilesPath() const;
+    QString trashInfoPath() const;
+    QString buildUniquePath(const QString& destinationPath) const;
+    bool moveToTrash(const QString& targetPath, QString* error);
+    bool restoreFromTrash(const QString& trashPath, QString* error);
+    bool emptyTrash(QString* error);
 
     QFileSystemModel model;
     QStandardItemModel pinnedFoldersModel;
