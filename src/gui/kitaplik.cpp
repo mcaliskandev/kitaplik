@@ -94,6 +94,15 @@ bool removeRecursively(const QString& path, QString* error)
     if (!info.exists())
         return true;
 
+    if (info.isSymLink()) {
+        if (!QFile::remove(path)) {
+            if (error)
+                *error = QString("Failed to delete symbolic link: %1").arg(path);
+            return false;
+        }
+        return true;
+    }
+
     if (info.isDir()) {
         QDir dir(path);
         if (!dir.removeRecursively()) {
@@ -229,8 +238,10 @@ std::optional<std::uint64_t> totalBytesForPath(const QString& path, QString* err
     if (!info.exists())
         return 0;
 
-    if (info.isFile() || info.isSymLink())
+    if (info.isFile())
         return static_cast<std::uint64_t>(info.size());
+    if (info.isSymLink())
+        return 0;
 
     if (!info.isDir()) {
         if (error)
@@ -319,10 +330,12 @@ bool copyFileWithProgress(const QString& srcPath,
         return false;
     }
 
-    QFile dst(destPath);
+    const QString tempPath = QString("%1.kitaplik-tmp-%2")
+                                 .arg(destPath, QString::number(QDateTime::currentMSecsSinceEpoch()));
+    QFile dst(tempPath);
     if (!dst.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
         if (error)
-            *error = QString("Failed to create destination: %1").arg(destPath);
+            *error = QString("Failed to create temporary file: %1").arg(tempPath);
         return false;
     }
 
@@ -331,6 +344,7 @@ bool copyFileWithProgress(const QString& srcPath,
     while (!src.atEnd()) {
         const qint64 n = src.read(buffer.data(), buffer.size());
         if (n < 0) {
+            dst.remove();
             if (error)
                 *error = QString("Read error: %1").arg(srcPath);
             return false;
@@ -338,8 +352,9 @@ bool copyFileWithProgress(const QString& srcPath,
         if (n == 0)
             break;
         if (dst.write(buffer.constData(), n) != n) {
+            dst.remove();
             if (error)
-                *error = QString("Write error: %1").arg(destPath);
+                *error = QString("Write error: %1").arg(tempPath);
             return false;
         }
         if (doneBytes) {
@@ -348,6 +363,20 @@ bool copyFileWithProgress(const QString& srcPath,
         }
     }
     dst.flush();
+    dst.close();
+
+    if (QFileInfo::exists(destPath) && !QFile::remove(destPath)) {
+        QFile::remove(tempPath);
+        if (error)
+            *error = QString("Failed to replace destination: %1").arg(destPath);
+        return false;
+    }
+    if (!QFile::rename(tempPath, destPath)) {
+        QFile::remove(tempPath);
+        if (error)
+            *error = QString("Failed to finalize destination: %1").arg(destPath);
+        return false;
+    }
     return true;
 }
 
@@ -368,6 +397,44 @@ bool copyRecursivelyWithProgress(const QString& sourcePath,
         if (error)
             *error = QString("Missing source: %1").arg(sourcePath);
         return false;
+    }
+
+    if (srcInfo.isSymLink()) {
+        if (QFileInfo::exists(destPath)) {
+            const ConflictChoice choice = resolveConflict(sourcePath, destPath, false);
+            if (choice == ConflictChoice::Cancel) {
+                if (cancelledByUser)
+                    *cancelledByUser = true;
+                if (error)
+                    *error = QStringLiteral("Operation cancelled.");
+                return false;
+            }
+            if (choice == ConflictChoice::Skip)
+                return true;
+            if (choice == ConflictChoice::KeepBoth)
+                destPath = makeUniqueKeepBothPath(destPath);
+            if (choice == ConflictChoice::Replace) {
+                QString rmError;
+                if (!removeRecursively(destPath, &rmError)) {
+                    if (error)
+                        *error = rmError.isEmpty() ? QString("Failed to replace destination: %1").arg(destPath) : rmError;
+                    return false;
+                }
+            }
+        }
+
+        const QString linkTarget = srcInfo.symLinkTarget();
+        if (linkTarget.trimmed().isEmpty()) {
+            if (error)
+                *error = QString("Invalid symbolic link: %1").arg(sourcePath);
+            return false;
+        }
+        if (!QFile::link(linkTarget, destPath)) {
+            if (error)
+                *error = QString("Failed to copy symbolic link:\n%1\n→ %2").arg(sourcePath, destPath);
+            return false;
+        }
+        return true;
     }
 
     if (srcInfo.isDir()) {
