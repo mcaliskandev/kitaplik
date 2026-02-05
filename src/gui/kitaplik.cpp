@@ -27,6 +27,7 @@
 #include <QPointer>
 #include <QPushButton>
 #include <QResource>
+#include <QScrollBar>
 #include <QSortFilterProxyModel>
 #include <QStorageInfo>
 #include <QStyledItemDelegate>
@@ -605,6 +606,11 @@ Kitaplik::Kitaplik(QWidget* parent)
 
     updateGoToPathButton();
 
+    watchedRefreshDebounceTimer.setSingleShot(true);
+    watchedRefreshDebounceTimer.setInterval(200);
+    connect(&directoryWatcher, &QFileSystemWatcher::directoryChanged, this, &Kitaplik::scheduleWatchedRefresh);
+    connect(&watchedRefreshDebounceTimer, &QTimer::timeout, this, &Kitaplik::refreshCurrentDirectoryPreservingView);
+
     QTimer::singleShot(0, this, [this] { ui->treeView->setFocus(Qt::OtherFocusReason); });
 }
 
@@ -1168,6 +1174,7 @@ void Kitaplik::navigateTo(const QString& path, bool recordHistory)
         }
     }
 
+    updateDirectoryWatcher(normalized);
     emit currentPathChanged(normalized);
 }
 
@@ -1270,4 +1277,87 @@ QModelIndex Kitaplik::mapToSourceIndex(const QModelIndex& proxyIndex) const
     if (!sortProxy)
         return proxyIndex;
     return sortProxy->mapToSource(proxyIndex);
+}
+
+void Kitaplik::updateDirectoryWatcher(const QString& path)
+{
+    const QString normalized = normalizePathForFs(path);
+    const QStringList watchedPaths = directoryWatcher.directories();
+    if (!watchedPaths.isEmpty())
+        directoryWatcher.removePaths(watchedPaths);
+    if (QFileInfo(normalized).exists() && QFileInfo(normalized).isDir())
+        directoryWatcher.addPath(normalized);
+}
+
+void Kitaplik::scheduleWatchedRefresh(const QString& changedPath)
+{
+    const QString normalized = normalizePathForFs(changedPath);
+    if (normalizePathForFs(currentPath()) != normalized)
+        return;
+
+    pendingWatchedPath = normalized;
+    watchedRefreshDebounceTimer.start();
+}
+
+void Kitaplik::refreshCurrentDirectoryPreservingView()
+{
+    const QString activePath = normalizePathForFs(currentPath());
+    if (pendingWatchedPath.trimmed().isEmpty())
+        pendingWatchedPath = activePath;
+    if (normalizePathForFs(pendingWatchedPath) != activePath)
+        return;
+    pendingWatchedPath.clear();
+
+    QStringList selectedPaths;
+    if (const QItemSelectionModel* selection = ui->treeView->selectionModel()) {
+        const QModelIndexList indexes = selection->selectedRows(0);
+        selectedPaths.reserve(indexes.size());
+        for (const QModelIndex& proxyIndex : indexes) {
+            const QModelIndex sourceIndex = mapToSourceIndex(proxyIndex);
+            if (!sourceIndex.isValid())
+                continue;
+            selectedPaths.push_back(model.filePath(sourceIndex));
+        }
+    }
+
+    const int scrollValue = ui->treeView->verticalScrollBar() ? ui->treeView->verticalScrollBar()->value() : 0;
+    const QModelIndex existingCurrentProxy = ui->treeView->currentIndex();
+    QString currentItemPath;
+    if (existingCurrentProxy.isValid()) {
+        const QModelIndex currentSource = mapToSourceIndex(existingCurrentProxy);
+        if (currentSource.isValid())
+            currentItemPath = model.filePath(currentSource);
+    }
+
+    const QModelIndex rootIndex = model.setRootPath(activePath);
+    if (!rootIndex.isValid())
+        return;
+    const QModelIndex proxyRootIndex = sortProxy ? sortProxy->mapFromSource(rootIndex) : rootIndex;
+    ui->treeView->setRootIndex(proxyRootIndex);
+
+    if (QItemSelectionModel* selection = ui->treeView->selectionModel()) {
+        selection->clearSelection();
+        for (const QString& itemPath : selectedPaths) {
+            const QModelIndex sourceIndex = model.index(itemPath);
+            if (!sourceIndex.isValid())
+                continue;
+            const QModelIndex proxyIndex = sortProxy ? sortProxy->mapFromSource(sourceIndex) : sourceIndex;
+            if (proxyIndex.isValid())
+                selection->select(proxyIndex, QItemSelectionModel::Select | QItemSelectionModel::Rows);
+        }
+    }
+
+    if (!currentItemPath.trimmed().isEmpty()) {
+        const QModelIndex sourceCurrent = model.index(currentItemPath);
+        if (sourceCurrent.isValid()) {
+            const QModelIndex proxyCurrent = sortProxy ? sortProxy->mapFromSource(sourceCurrent) : sourceCurrent;
+            if (proxyCurrent.isValid())
+                ui->treeView->setCurrentIndex(proxyCurrent);
+        }
+    }
+
+    QTimer::singleShot(0, this, [this, scrollValue] {
+        if (ui->treeView->verticalScrollBar())
+            ui->treeView->verticalScrollBar()->setValue(scrollValue);
+    });
 }

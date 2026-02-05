@@ -2,9 +2,11 @@
 #define KITAPLIK_HPP
 
 #include <QFileSystemModel>
+#include <QFileSystemWatcher>
 #include <QPoint>
 #include <QStandardItemModel>
 #include <QStringListModel>
+#include <QTimer>
 #include <QWidget>
 
 #include <atomic>
@@ -74,6 +76,9 @@ private:
     void updateFileInfoView(const QModelIndex& index);
     void addPinnedFolder(const QString& label, const QString& path);
     QModelIndex mapToSourceIndex(const QModelIndex& proxyIndex) const;
+    void updateDirectoryWatcher(const QString& path);
+    void scheduleWatchedRefresh(const QString& changedPath);
+    void refreshCurrentDirectoryPreservingView();
 
     QFileSystemModel model;
     QStandardItemModel pinnedFoldersModel;
@@ -90,6 +95,9 @@ private:
     std::jthread fileOpThread;
     std::atomic_bool pasteInProgress = false;
     QString pasteOpLabel;
+    QFileSystemWatcher directoryWatcher;
+    QTimer watchedRefreshDebounceTimer;
+    QString pendingWatchedPath;
 };
 
 #endif // KITAPLIK_HPP
