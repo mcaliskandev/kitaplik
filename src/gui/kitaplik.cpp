@@ -25,6 +25,7 @@
 #include <QMetaObject>
 #include <QPainter>
 #include <QPointer>
+#include <QPushButton>
 #include <QResource>
 #include <QSortFilterProxyModel>
 #include <QStyledItemDelegate>
@@ -105,69 +106,134 @@ bool removeRecursively(const QString& path, QString* error)
     return true;
 }
 
-bool copyRecursively(const QString& sourcePath, const QString& destPath, QString* error)
+enum class ConflictChoice
 {
-    const QFileInfo srcInfo(sourcePath);
-    if (!srcInfo.exists()) {
-        if (error)
-            *error = QString("Missing source: %1").arg(sourcePath);
-        return false;
+    Replace,
+    Skip,
+    KeepBoth,
+    Cancel,
+};
+
+using ConflictResolver = std::function<ConflictChoice(const QString& sourcePath, const QString& destinationPath, bool isDirectory)>;
+
+QString makeUniqueKeepBothPath(const QString& destinationPath)
+{
+    const QFileInfo destinationInfo(destinationPath);
+    const QDir parentDir = destinationInfo.dir();
+
+    QString baseName;
+    QString suffix;
+    if (destinationInfo.isDir()) {
+        baseName = destinationInfo.fileName();
+    } else {
+        baseName = destinationInfo.completeBaseName();
+        suffix = destinationInfo.completeSuffix();
+        if (!suffix.trimmed().isEmpty())
+            suffix.prepend('.');
     }
 
-    if (srcInfo.isDir()) {
-        if (QFileInfo::exists(destPath) && !QFileInfo(destPath).isDir()) {
+    if (baseName.trimmed().isEmpty())
+        baseName = destinationInfo.fileName();
+
+    for (int i = 1; i <= 10000; ++i) {
+        const QString candidateName = i == 1
+            ? QString("%1 (copy)%2").arg(baseName, suffix)
+            : QString("%1 (copy %2)%3").arg(baseName, QString::number(i), suffix);
+        const QString candidatePath = parentDir.filePath(candidateName);
+        if (!QFileInfo::exists(candidatePath))
+            return candidatePath;
+    }
+
+    return parentDir.filePath(QString("%1 (%2)%3").arg(baseName, QString::number(QDateTime::currentMSecsSinceEpoch()), suffix));
+}
+
+std::optional<std::uint64_t> totalBytesForPath(const QString& path, QString* error)
+{
+    const QFileInfo info(path);
+    if (!info.exists())
+        return 0;
+
+    if (info.isFile() || info.isSymLink())
+        return static_cast<std::uint64_t>(info.size());
+
+    if (!info.isDir()) {
+        if (error)
+            *error = QString("Unsupported file type: %1").arg(path);
+        return std::nullopt;
+    }
+
+    std::uint64_t total = 0;
+    QDir dir(path);
+    const QFileInfoList entries = dir.entryInfoList(QDir::NoDotAndDotDot | QDir::AllEntries);
+    for (const QFileInfo& entry : entries) {
+        QString childError;
+        const auto child = totalBytesForPath(entry.absoluteFilePath(), &childError);
+        if (!child.has_value()) {
             if (error)
-                *error = QString("Destination exists and isn't a directory: %1").arg(destPath);
-            return false;
+                *error = childError;
+            return std::nullopt;
         }
-
-        if (!QFileInfo::exists(destPath)) {
-            QDir parent = QFileInfo(destPath).dir();
-            const QString name = QFileInfo(destPath).fileName();
-            if (!parent.mkdir(name)) {
-                if (error)
-                    *error = QString("Failed to create directory: %1").arg(destPath);
-                return false;
-            }
-        }
-
-        QDir srcDir(sourcePath);
-        const QFileInfoList entries =
-            srcDir.entryInfoList(QDir::NoDotAndDotDot | QDir::AllEntries, QDir::Name | QDir::DirsFirst);
-        for (const QFileInfo& entry : entries) {
-            const QString srcChild = entry.absoluteFilePath();
-            const QString destChild = QDir(destPath).filePath(entry.fileName());
-            if (!copyRecursively(srcChild, destChild, error))
-                return false;
-        }
-        return true;
+        total += *child;
     }
+    return total;
+}
 
-    if (QFileInfo::exists(destPath)) {
+bool advanceProgressByPathSize(const QString& path,
+                               std::uint64_t* doneBytes,
+                               std::uint64_t totalBytes,
+                               const std::function<void(std::uint64_t, std::uint64_t)>& onProgress,
+                               QString* error)
+{
+    QString sizeError;
+    const auto size = totalBytesForPath(path, &sizeError);
+    if (!size.has_value()) {
         if (error)
-            *error = QString("Destination already exists: %1").arg(destPath);
+            *error = sizeError;
         return false;
     }
 
-    if (!QFile::copy(sourcePath, destPath)) {
-        if (error)
-            *error = QString("Failed to copy file:\n%1\n→ %2").arg(sourcePath, destPath);
-        return false;
-    }
+    if (doneBytes)
+        *doneBytes += *size;
+
+    if (totalBytes > 0)
+        onProgress(*doneBytes, totalBytes);
+
     return true;
 }
 
 bool copyFileWithProgress(const QString& srcPath,
-                          const QString& destPath,
+                          QString destPath,
                           std::uint64_t* doneBytes,
                           std::uint64_t totalBytes,
                           const std::function<void(std::uint64_t, std::uint64_t)>& onProgress,
+                          const ConflictResolver& resolveConflict,
+                          bool* cancelledByUser,
                           QString* error)
 {
+    if (cancelledByUser)
+        *cancelledByUser = false;
+
     if (QFileInfo::exists(destPath)) {
-        if (error)
-            *error = QString("Destination already exists: %1").arg(destPath);
-        return false;
+        const ConflictChoice choice = resolveConflict(srcPath, destPath, false);
+        if (choice == ConflictChoice::Cancel) {
+            if (cancelledByUser)
+                *cancelledByUser = true;
+            if (error)
+                *error = QStringLiteral("Operation cancelled.");
+            return false;
+        }
+        if (choice == ConflictChoice::Skip)
+            return advanceProgressByPathSize(srcPath, doneBytes, totalBytes, onProgress, error);
+        if (choice == ConflictChoice::KeepBoth)
+            destPath = makeUniqueKeepBothPath(destPath);
+        if (choice == ConflictChoice::Replace) {
+            QString rmError;
+            if (!removeRecursively(destPath, &rmError)) {
+                if (error)
+                    *error = rmError.isEmpty() ? QString("Failed to replace destination: %1").arg(destPath) : rmError;
+                return false;
+            }
+        }
     }
 
     QFile src(srcPath);
@@ -209,44 +275,18 @@ bool copyFileWithProgress(const QString& srcPath,
     return true;
 }
 
-std::optional<std::uint64_t> totalBytesForPath(const QString& path, QString* error)
-{
-    const QFileInfo info(path);
-    if (!info.exists())
-        return 0;
-
-    if (info.isFile() || info.isSymLink())
-        return static_cast<std::uint64_t>(info.size());
-
-    if (!info.isDir()) {
-        if (error)
-            *error = QString("Unsupported file type: %1").arg(path);
-        return std::nullopt;
-    }
-
-    std::uint64_t total = 0;
-    QDir dir(path);
-    const QFileInfoList entries = dir.entryInfoList(QDir::NoDotAndDotDot | QDir::AllEntries);
-    for (const QFileInfo& entry : entries) {
-        QString childError;
-        const auto child = totalBytesForPath(entry.absoluteFilePath(), &childError);
-        if (!child.has_value()) {
-            if (error)
-                *error = childError;
-            return std::nullopt;
-        }
-        total += *child;
-    }
-    return total;
-}
-
 bool copyRecursivelyWithProgress(const QString& sourcePath,
-                                 const QString& destPath,
+                                 QString destPath,
                                  std::uint64_t* doneBytes,
                                  std::uint64_t totalBytes,
                                  const std::function<void(std::uint64_t, std::uint64_t)>& onProgress,
+                                 const ConflictResolver& resolveConflict,
+                                 bool* cancelledByUser,
                                  QString* error)
 {
+    if (cancelledByUser)
+        *cancelledByUser = false;
+
     const QFileInfo srcInfo(sourcePath);
     if (!srcInfo.exists()) {
         if (error)
@@ -255,10 +295,27 @@ bool copyRecursivelyWithProgress(const QString& sourcePath,
     }
 
     if (srcInfo.isDir()) {
-        if (QFileInfo::exists(destPath) && !QFileInfo(destPath).isDir()) {
-            if (error)
-                *error = QString("Destination exists and isn't a directory: %1").arg(destPath);
-            return false;
+        if (QFileInfo::exists(destPath)) {
+            const ConflictChoice choice = resolveConflict(sourcePath, destPath, true);
+            if (choice == ConflictChoice::Cancel) {
+                if (cancelledByUser)
+                    *cancelledByUser = true;
+                if (error)
+                    *error = QStringLiteral("Operation cancelled.");
+                return false;
+            }
+            if (choice == ConflictChoice::Skip)
+                return advanceProgressByPathSize(sourcePath, doneBytes, totalBytes, onProgress, error);
+            if (choice == ConflictChoice::KeepBoth)
+                destPath = makeUniqueKeepBothPath(destPath);
+            if (choice == ConflictChoice::Replace) {
+                QString rmError;
+                if (!removeRecursively(destPath, &rmError)) {
+                    if (error)
+                        *error = rmError.isEmpty() ? QString("Failed to replace destination: %1").arg(destPath) : rmError;
+                    return false;
+                }
+            }
         }
 
         if (!QFileInfo::exists(destPath)) {
@@ -269,6 +326,10 @@ bool copyRecursivelyWithProgress(const QString& sourcePath,
                     *error = QString("Failed to create directory: %1").arg(destPath);
                 return false;
             }
+        } else if (!QFileInfo(destPath).isDir()) {
+            if (error)
+                *error = QString("Destination exists and isn't a directory: %1").arg(destPath);
+            return false;
         }
 
         QDir srcDir(sourcePath);
@@ -277,13 +338,27 @@ bool copyRecursivelyWithProgress(const QString& sourcePath,
         for (const QFileInfo& entry : entries) {
             const QString srcChild = entry.absoluteFilePath();
             const QString destChild = QDir(destPath).filePath(entry.fileName());
-            if (!copyRecursivelyWithProgress(srcChild, destChild, doneBytes, totalBytes, onProgress, error))
+            if (!copyRecursivelyWithProgress(srcChild,
+                                             destChild,
+                                             doneBytes,
+                                             totalBytes,
+                                             onProgress,
+                                             resolveConflict,
+                                             cancelledByUser,
+                                             error))
                 return false;
         }
         return true;
     }
 
-    return copyFileWithProgress(sourcePath, destPath, doneBytes, totalBytes, onProgress, error);
+    return copyFileWithProgress(sourcePath,
+                                destPath,
+                                doneBytes,
+                                totalBytes,
+                                onProgress,
+                                resolveConflict,
+                                cancelledByUser,
+                                error);
 }
 
 } // namespace
@@ -418,15 +493,10 @@ Kitaplik::Kitaplik(QWidget* parent)
     fileInfoModel.setColumnCount(2);
     fileInfoModel.setHeaderData(0, Qt::Horizontal, "Property");
     fileInfoModel.setHeaderData(1, Qt::Horizontal, "Value");
-    ui->fileInfoView->horizontalHeader()->setStretchLastSection(true);
-    ui->fileInfoView->verticalHeader()->setVisible(false);
-    ui->fileInfoView->setEditTriggers(QAbstractItemView::NoEditTriggers);
 
-    connect(ui->treeView->selectionModel(), &QItemSelectionModel::currentChanged, this,
-            [this](const QModelIndex& current, const QModelIndex&) { updateFileInfoView(current); });
-
+    pinnedFoldersModel.setColumnCount(1);
+    pinnedFoldersModel.setHeaderData(0, Qt::Horizontal, "Pinned");
     ui->listViewForPinnedFolders->setModel(&pinnedFoldersModel);
-    ui->listViewForPinnedFolders->setEditTriggers(QAbstractItemView::NoEditTriggers);
 
     model.setFilter(QDir::AllEntries | QDir::NoDotAndDotDot);
     model.setRootPath(QDir::homePath());
@@ -695,6 +765,49 @@ void Kitaplik::onMenuPaste(const QString& destDir)
                 Qt::QueuedConnection);
         };
 
+        const auto resolveConflict = [self](const QString& sourcePath, const QString& destinationPath, bool isDirectory) {
+            if (!self)
+                return ConflictChoice::Cancel;
+
+            ConflictChoice choice = ConflictChoice::Skip;
+            QMetaObject::invokeMethod(
+                self,
+                [self, sourcePath, destinationPath, isDirectory, &choice] {
+                    if (!self) {
+                        choice = ConflictChoice::Cancel;
+                        return;
+                    }
+
+                    QMessageBox box(self);
+                    box.setIcon(QMessageBox::Question);
+                    box.setWindowTitle("Paste conflict");
+                    box.setText(isDirectory
+                        ? QString("A folder already exists at destination:\n%1").arg(destinationPath)
+                        : QString("A file already exists at destination:\n%1").arg(destinationPath));
+                    box.setInformativeText(QString("Source: %1").arg(sourcePath));
+
+                    QPushButton* replaceButton = box.addButton("Replace", QMessageBox::AcceptRole);
+                    QPushButton* skipButton = box.addButton("Skip", QMessageBox::DestructiveRole);
+                    QPushButton* keepBothButton = box.addButton("Keep both", QMessageBox::ActionRole);
+                    QPushButton* cancelButton = box.addButton(QMessageBox::Cancel);
+                    box.setDefaultButton(skipButton);
+
+                    box.exec();
+                    if (box.clickedButton() == replaceButton)
+                        choice = ConflictChoice::Replace;
+                    else if (box.clickedButton() == keepBothButton)
+                        choice = ConflictChoice::KeepBoth;
+                    else if (box.clickedButton() == cancelButton)
+                        choice = ConflictChoice::Cancel;
+                    else
+                        choice = ConflictChoice::Skip;
+                },
+                Qt::BlockingQueuedConnection);
+
+            return choice;
+        };
+
+        bool userCancelled = false;
         for (int i = 0; i < sourcePaths.size(); i++) {
             const QString& srcPath = sourcePaths.at(i);
             const QFileInfo srcInfo(srcPath);
@@ -708,10 +821,12 @@ void Kitaplik::onMenuPaste(const QString& destDir)
             QString error;
             bool ok = false;
             if (isCut) {
-                if (srcInfo.isDir())
-                    ok = QDir().rename(srcPath, destPath);
-                else
-                    ok = QFile::rename(srcPath, destPath);
+                if (!QFileInfo::exists(destPath)) {
+                    if (srcInfo.isDir())
+                        ok = QDir().rename(srcPath, destPath);
+                    else
+                        ok = QFile::rename(srcPath, destPath);
+                }
 
                 if (ok) {
                     const auto idx = static_cast<size_t>(i);
@@ -719,8 +834,15 @@ void Kitaplik::onMenuPaste(const QString& destDir)
                         doneBytes += perSrcBytes[idx];
                     progress(doneBytes, totalBytes);
                 } else {
-                    // cross-device move fallback
-                    ok = copyRecursivelyWithProgress(srcPath, destPath, &doneBytes, totalBytes, progress, &error);
+                    // cross-device move fallback and destination-conflict handling
+                    ok = copyRecursivelyWithProgress(srcPath,
+                                                     destPath,
+                                                     &doneBytes,
+                                                     totalBytes,
+                                                     progress,
+                                                     resolveConflict,
+                                                     &userCancelled,
+                                                     &error);
                     if (ok) {
                         QString rmErr;
                         if (!removeRecursively(srcPath, &rmErr)) {
@@ -732,10 +854,19 @@ void Kitaplik::onMenuPaste(const QString& destDir)
                         error = QString("Failed to move:\n%1\n→ %2").arg(srcPath, destPath);
                 }
             } else {
-                ok = copyRecursivelyWithProgress(srcPath, destPath, &doneBytes, totalBytes, progress, &error);
+                ok = copyRecursivelyWithProgress(srcPath,
+                                                 destPath,
+                                                 &doneBytes,
+                                                 totalBytes,
+                                                 progress,
+                                                 resolveConflict,
+                                                 &userCancelled,
+                                                 &error);
             }
 
             if (!ok) {
+                if (userCancelled)
+                    break;
                 if (error.trimmed().isEmpty())
                     error = QString("Paste failed for: %1").arg(srcPath);
                 errors.push_back(error);
@@ -744,7 +875,13 @@ void Kitaplik::onMenuPaste(const QString& destDir)
 
         progress(doneBytes, totalBytes);
 
-        const QString errorText = errors.join("\n\n");
+        QString errorText = errors.join("\n\n");
+        if (userCancelled) {
+            if (!errorText.trimmed().isEmpty())
+                errorText += "\n\n";
+            errorText += "Operation cancelled.";
+        }
+
         const bool clearClipboard = errorText.trimmed().isEmpty() && isCut;
 
         if (!self)
@@ -978,40 +1115,37 @@ void Kitaplik::updateFileInfoView(const QModelIndex& index)
             : QStringLiteral("<unknown>");
     };
 
-    addRow("Name", info.fileName());
+    const QString itemName = info.fileName().trimmed().isEmpty() ? info.absoluteFilePath() : info.fileName();
+    addRow("Name", itemName);
     addRow("Path", info.absoluteFilePath());
-    QString type = "Other";
-    if (info.isDir())
-        type = "Directory";
-    else if (info.isSymLink())
-        type = "Symbolic Link";
-    else if (info.isFile())
-        type = "File";
-    addRow("Type", type);
-
-    const QString sizeText = info.isDir()
-        ? QStringLiteral("<directory>")
-        : QLocale::system().formattedDataSize(info.size());
-    addRow("Size", sizeText);
-
-    addRow("Last Modified", formatDate(info.lastModified()));
-    addRow("Last Read", formatDate(info.lastRead()));
+    addRow("Type", info.isDir() ? "Folder" : "File");
+    if (info.isFile())
+        addRow("Size", QLocale::system().formattedDataSize(info.size()));
+    addRow("Modified", formatDate(info.lastModified()));
     addRow("Created", formatDate(info.birthTime()));
+    addRow("Permissions", info.permissions() == QFileDevice::Permissions() ? "None" : "Readable");
 }
 
 void Kitaplik::addPinnedFolder(const QString& label, const QString& path)
 {
-    const QIcon icon = QIcon::fromTheme("user-home", QApplication::style()->standardIcon(QStyle::SP_DirHomeIcon));
-    auto* item = new QStandardItem(icon, label);
-    item->setData(cleanPath(path), PinnedPathRole);
+    const QString clean = QDir(path).absolutePath();
+    for (int row = 0; row < pinnedFoldersModel.rowCount(); ++row) {
+        const QModelIndex idx = pinnedFoldersModel.index(row, 0);
+        if (idx.data(PinnedPathRole).toString() == clean)
+            return;
+    }
+
+    QStandardItem* item = new QStandardItem(label);
+    item->setData(clean, PinnedPathRole);
+    item->setToolTip(clean);
     pinnedFoldersModel.appendRow(item);
 }
 
 QModelIndex Kitaplik::mapToSourceIndex(const QModelIndex& proxyIndex) const
 {
+    if (!proxyIndex.isValid())
+        return {};
     if (!sortProxy)
         return proxyIndex;
-    if (!proxyIndex.isValid())
-        return QModelIndex();
     return sortProxy->mapToSource(proxyIndex);
 }
