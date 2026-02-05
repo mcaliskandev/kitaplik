@@ -84,6 +84,7 @@ QString cleanPath(const QString& path)
 }
 
 constexpr int PinnedPathRole = Qt::UserRole + 1;
+constexpr int PinnedReadOnlyRole = Qt::UserRole + 2;
 constexpr const char* ClipboardCutMimeType = "application/x-kitaplik-cut";
 
 bool removeRecursively(const QString& path, QString* error)
@@ -575,7 +576,7 @@ Kitaplik::Kitaplik(QWidget* parent)
     model.setFilter(QDir::AllEntries | QDir::NoDotAndDotDot);
     model.setRootPath(QDir::homePath());
 
-    addPinnedFolder("Home", QDir::homePath());
+    refreshSidebarLocations();
     setRootPath(QDir::homePath());
     updateNavButtons();
 
@@ -1291,8 +1292,67 @@ void Kitaplik::addPinnedFolder(const QString& label, const QString& path)
 
     QStandardItem* item = new QStandardItem(label);
     item->setData(clean, PinnedPathRole);
+    item->setData(false, PinnedReadOnlyRole);
     item->setToolTip(clean);
     pinnedFoldersModel.appendRow(item);
+}
+
+void Kitaplik::addMountedDrivesReadOnly()
+{
+    const QList<QStorageInfo> volumes = QStorageInfo::mountedVolumes();
+    for (const QStorageInfo& volume : volumes) {
+        if (!volume.isValid() || !volume.isReady())
+            continue;
+        const QString rootPath = normalizePathForFs(volume.rootPath());
+        if (rootPath.trimmed().isEmpty())
+            continue;
+
+        bool alreadyAdded = false;
+        for (int row = 0; row < pinnedFoldersModel.rowCount(); ++row) {
+            const QModelIndex idx = pinnedFoldersModel.index(row, 0);
+            if (normalizePathForFs(idx.data(PinnedPathRole).toString()) == rootPath) {
+                alreadyAdded = true;
+                break;
+            }
+        }
+        if (alreadyAdded)
+            continue;
+
+        QString label = volume.displayName().trimmed();
+        if (label.isEmpty())
+            label = QFileInfo(rootPath).fileName();
+        if (label.trimmed().isEmpty())
+            label = rootPath;
+        if (volume.isReadOnly())
+            label += " [RO]";
+
+        QStandardItem* item = new QStandardItem(label);
+        item->setData(rootPath, PinnedPathRole);
+        item->setData(volume.isReadOnly(), PinnedReadOnlyRole);
+        item->setToolTip(QString("%1\nDevice: %2").arg(rootPath, volume.device()));
+        pinnedFoldersModel.appendRow(item);
+    }
+}
+
+void Kitaplik::refreshSidebarLocations()
+{
+    pinnedFoldersModel.clear();
+    pinnedFoldersModel.setColumnCount(1);
+    pinnedFoldersModel.setHeaderData(0, Qt::Horizontal, "Pinned");
+
+    addPinnedFolder("Home", QDir::homePath());
+    const QString desktop = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation);
+    if (!desktop.trimmed().isEmpty())
+        addPinnedFolder("Desktop", desktop);
+    const QString documents = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    if (!documents.trimmed().isEmpty())
+        addPinnedFolder("Documents", documents);
+    const QString downloads = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+    if (!downloads.trimmed().isEmpty())
+        addPinnedFolder("Downloads", downloads);
+    addPinnedFolder("Trash", trashFilesPath());
+
+    addMountedDrivesReadOnly();
 }
 
 QModelIndex Kitaplik::mapToSourceIndex(const QModelIndex& proxyIndex) const

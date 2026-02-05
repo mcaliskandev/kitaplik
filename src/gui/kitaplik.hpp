@@ -77,6 +77,8 @@ private:
     void refreshHistoryView();
     void updateFileInfoView(const QModelIndex& index);
     void addPinnedFolder(const QString& label, const QString& path);
+    void refreshSidebarLocations();
+    void addMountedDrivesReadOnly();
     QModelIndex mapToSourceIndex(const QModelIndex& proxyIndex) const;
     void updateDirectoryWatcher(const QString& path);
     void scheduleWatchedRefresh(const QString& changedPath);
